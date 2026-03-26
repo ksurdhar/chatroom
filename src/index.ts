@@ -47,6 +47,7 @@ async function main() {
   console.log(chalk.dim("  Ctrl+C          → interrupt focused target (does not exit)"));
   console.log(chalk.dim("  Esc Esc         → force-exit and terminate active agents"));
   console.log(chalk.dim("  /respond N      → agents take N turns responding to each other"));
+  console.log(chalk.dim("  /clear or /new  → start fresh session for focused target"));
   console.log(chalk.dim("  /quit           → force-exit\n"));
 
   if (claudeSession || codexSession) {

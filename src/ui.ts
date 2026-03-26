@@ -204,6 +204,17 @@ export async function runChatLoop(
     return mode === "both" ? ["claude", "codex"] : [mode];
   }
 
+  function resetChatsForMode(mode: TargetMode) {
+    if (mode === "both") {
+      transcript.length = 0;
+    }
+
+    for (const agent of selectedTargets(mode)) {
+      sessions[agent].sessionId = null;
+      sessions[agent].lastMessageIndex = mode === "both" ? -1 : transcript.length - 1;
+    }
+  }
+
   function forceExit() {
     if (exitInProgress) return;
     exitInProgress = true;
@@ -400,6 +411,17 @@ export async function runChatLoop(
     async function processInput(fullInput: string) {
       const trimmed = fullInput.trim();
       if (!trimmed) {
+        refreshPrompt();
+        return;
+      }
+
+      if (trimmed === "/clear" || trimmed === "/new") {
+        resetChatsForMode(targetMode);
+        ensureNewline();
+        process.stdout.write(
+          chalk.cyan(`\n  [started new chat for ${targetLabel(targetMode)}]\n\n`),
+        );
+        midLine = false;
         refreshPrompt();
         return;
       }
