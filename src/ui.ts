@@ -647,13 +647,22 @@ export async function runChatLoop(
         redrawStatusLine();
 
         for (let i = 0; i < rounds; i++) {
-          const agent = order[i % 2];
-          if (wasInterrupted(agent)) break;
-          const prompt = buildPrompt(transcript, sessions[agent]);
+          const scheduledAgent = order[i % 2];
+          const fallbackAgent: AgentName = scheduledAgent === "claude" ? "codex" : "claude";
+          let agent = scheduledAgent;
+          if (wasInterrupted(scheduledAgent) && wasInterrupted(fallbackAgent)) break;
 
+          let prompt = buildPrompt(transcript, sessions[agent]);
           if (!prompt.trim()) {
+            agent = fallbackAgent;
+            if (!wasInterrupted(agent)) {
+              prompt = buildPrompt(transcript, sessions[agent]);
+            }
+          }
+
+          if (!prompt.trim() || wasInterrupted(agent)) {
             clearStatusLine();
-            process.stdout.write(chalk.dim(`  [nothing new for ${agent} to respond to]\n`));
+            process.stdout.write(chalk.dim("  [nothing new for either agent to respond to]\n"));
             redrawStatusLine();
             break;
           }
