@@ -15,7 +15,6 @@ const BOLD_COLORS: Record<AgentName, (s: string) => string> = {
 };
 
 const SPINNER_FRAMES = ["|", "/", "-", "\\"];
-const DOUBLE_ESC_WINDOW_MS = 500;
 const FORCE_EXIT_GRACE_MS = 250;
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
@@ -112,7 +111,6 @@ export async function runChatLoop(
   let statusTimer: ReturnType<typeof setInterval> | null = null;
   let rawModeEnabled = false;
   let exitInProgress = false;
-  let lastEscapeAt = 0;
   let lastInterruptAt = 0;
   let isPasting = false;
   let bracketedPasteRaw = "";
@@ -215,15 +213,14 @@ export async function runChatLoop(
     }
   }
 
-  function forceExit() {
+  function gracefulShutdown() {
     if (exitInProgress) return;
     exitInProgress = true;
     processing = false;
     stopStatusLoop();
-    process.stdout.write("\x1b[?2004l");
 
     ensureNewline();
-    process.stdout.write(chalk.yellow("\n  [exiting: terminating active agents...]\n"));
+    process.stdout.write(chalk.yellow("\n  [shutting down...]\n"));
     midLine = false;
 
     terminateAll("SIGINT");
@@ -231,7 +228,6 @@ export async function runChatLoop(
     setTimeout(() => {
       terminateAll("SIGKILL");
       rl.close();
-      process.exit(0);
     }, FORCE_EXIT_GRACE_MS);
   }
 
@@ -277,7 +273,18 @@ export async function runChatLoop(
     const now = Date.now();
     if (now - lastInterruptAt < 80) return;
     lastInterruptAt = now;
-    lastEscapeAt = 0;
+
+    if (exitInProgress) {
+      terminateAll("SIGKILL");
+      process.exit(1);
+      return;
+    }
+
+    if (!processing) {
+      gracefulShutdown();
+      return;
+    }
+
     interruptSelected(targetMode);
   }
 
@@ -347,7 +354,7 @@ export async function runChatLoop(
       if (processing) {
         ensureNewline();
         process.stdout.write(
-          chalk.dim("\n  [busy: wait, press Ctrl+C to interrupt, or Esc Esc to exit]\n"),
+          chalk.dim("\n  [busy: wait, or press Ctrl+C to interrupt]\n"),
         );
         midLine = false;
         refreshPrompt();
@@ -359,22 +366,6 @@ export async function runChatLoop(
     if (isPasting) {
       // Buffer raw characters (including newlines) during paste
       bracketedPasteRaw += str;
-      return;
-    }
-
-    const isEscape = key?.name === "escape" || str === "\u001b";
-    if (isEscape) {
-      const now = Date.now();
-      if (now - lastEscapeAt <= DOUBLE_ESC_WINDOW_MS) {
-        lastEscapeAt = 0;
-        forceExit();
-      } else {
-        lastEscapeAt = now;
-        ensureNewline();
-        process.stdout.write(chalk.dim("\n  [press Esc again quickly to exit]\n\n"));
-        midLine = false;
-        refreshPrompt();
-      }
       return;
     }
 
@@ -427,7 +418,7 @@ export async function runChatLoop(
       }
 
       if (trimmed === "/quit" || trimmed === "/exit") {
-        forceExit();
+        gracefulShutdown();
         return;
       }
 
@@ -631,11 +622,11 @@ export async function runChatLoop(
       if (processing) {
         const trimmed = line.trim();
         if (trimmed === "/quit" || trimmed === "/exit") {
-          forceExit();
+          gracefulShutdown();
           return;
         }
         process.stdout.write(
-          chalk.dim("\n  [busy: wait, press Ctrl+C to interrupt, or Esc Esc to exit]\n"),
+          chalk.dim("\n  [busy: wait, or press Ctrl+C to interrupt]\n"),
         );
         refreshPrompt();
         return;
