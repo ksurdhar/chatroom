@@ -8,13 +8,33 @@ type ActivityCallback = () => void;
 const SILENCE_KILL_MS = 5 * 60 * 1000;
 const TOOL_SILENCE_KILL_MS = 30 * 60 * 1000;
 
-// Track active child processes so they can be interrupted
-export const activeProcesses: Set<ChildProcess> = new Set();
+// Track active child process per agent for targeted interrupts.
+export const activeProcesses: Map<AgentName, ChildProcess> = new Map();
 
 export function interruptAll(): void {
-  for (const child of activeProcesses) {
+  for (const child of activeProcesses.values()) {
     child.kill("SIGINT");
   }
+}
+
+export function terminateAll(signal: NodeJS.Signals): number {
+  let sent = 0;
+  for (const child of activeProcesses.values()) {
+    if (child.killed) continue;
+    if (child.kill(signal)) sent += 1;
+  }
+  return sent;
+}
+
+export function interruptAgent(agent: AgentName): boolean {
+  const child = activeProcesses.get(agent);
+  if (!child) return false;
+  child.kill("SIGINT");
+  return true;
+}
+
+export function hasActiveProcess(agent: AgentName): boolean {
+  return activeProcesses.has(agent);
 }
 
 function parseLines(
@@ -102,7 +122,7 @@ export function sendToClaude(
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env },
     });
-    activeProcesses.add(child);
+    activeProcesses.set("claude", child);
     const watchdog = createWatchdog("claude", child);
 
     let fullText = "";
@@ -180,7 +200,9 @@ export function sendToClaude(
     });
 
     child.on("close", (code) => {
-      activeProcesses.delete(child);
+      if (activeProcesses.get("claude") === child) {
+        activeProcesses.delete("claude");
+      }
       watchdog.clear();
 
       if (activeTools.size > 0) {
@@ -208,7 +230,9 @@ export function sendToClaude(
     });
 
     child.on("error", (err) => {
-      activeProcesses.delete(child);
+      if (activeProcesses.get("claude") === child) {
+        activeProcesses.delete("claude");
+      }
       watchdog.clear();
       reject(err);
     });
@@ -239,7 +263,7 @@ export function sendToCodex(
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env },
     });
-    activeProcesses.add(child);
+    activeProcesses.set("codex", child);
     const watchdog = createWatchdog("codex", child);
 
     let fullText = "";
@@ -326,7 +350,9 @@ export function sendToCodex(
     });
 
     child.on("close", (code) => {
-      activeProcesses.delete(child);
+      if (activeProcesses.get("codex") === child) {
+        activeProcesses.delete("codex");
+      }
       watchdog.clear();
 
       if (activeCommands.size > 0) {
@@ -354,7 +380,9 @@ export function sendToCodex(
     });
 
     child.on("error", (err) => {
-      activeProcesses.delete(child);
+      if (activeProcesses.get("codex") === child) {
+        activeProcesses.delete("codex");
+      }
       watchdog.clear();
       reject(err);
     });

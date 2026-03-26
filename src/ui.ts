@@ -2,7 +2,7 @@ import * as readline from "node:readline";
 import chalk from "chalk";
 import type { AgentName, AgentSession, Message, ToolUseEvent } from "./types.js";
 import { buildPrompt, parseInput } from "./transcript.js";
-import { sendToAgent, interruptAll } from "./agents.js";
+import { sendToAgent, hasActiveProcess, interruptAgent, interruptAll, terminateAll } from "./agents.js";
 
 const COLORS: Record<AgentName, (s: string) => string> = {
   claude: chalk.magenta,
@@ -15,6 +15,15 @@ const BOLD_COLORS: Record<AgentName, (s: string) => string> = {
 };
 
 const SPINNER_FRAMES = ["|", "/", "-", "\\"];
+const DOUBLE_ESC_WINDOW_MS = 500;
+const FORCE_EXIT_GRACE_MS = 250;
+const TARGET_MODE_CYCLE = ["both", "claude", "codex"] as const;
+type TargetMode = typeof TARGET_MODE_CYCLE[number];
+const TARGET_MODE_COLORS: Record<TargetMode, (s: string) => string> = {
+  both: chalk.cyan.bold,
+  claude: chalk.magenta.bold,
+  codex: chalk.green.bold,
+};
 
 interface AgentUiState {
   state: "idle" | "streaming" | "tool_running" | "done" | "error";
@@ -90,13 +99,18 @@ export async function runChatLoop(
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
-    prompt: chalk.bold.white("you> "),
+    prompt: chalk.bold.white("you @both> "),
   });
 
   let processing = false;
-  let interrupted = false;
+  let targetMode: TargetMode = "both";
+  let interruptedAgents = new Set<AgentName>();
   let spinnerIndex = 0;
   let statusTimer: ReturnType<typeof setInterval> | null = null;
+  let rawModeEnabled = false;
+  let exitInProgress = false;
+  let lastEscapeAt = 0;
+  let lastInterruptAt = 0;
   let agentStates = createInitialAgentStates();
 
   function resetAgentStates() {
@@ -156,8 +170,101 @@ export async function runChatLoop(
     return baseLabel;
   }
 
+  function wasInterrupted(agent: AgentName): boolean {
+    return interruptedAgents.has(agent);
+  }
+
+  function formatMode(mode: TargetMode): string {
+    return TARGET_MODE_COLORS[mode](`@${mode}`);
+  }
+
+  function printTargetMode(mode: TargetMode) {
+    ensureNewline();
+    const colorFn = TARGET_MODE_COLORS[mode];
+    process.stdout.write(colorFn(`  ▸ ${mode}`) + "\n");
+    midLine = false;
+  }
+
+  function cycleTargetMode() {
+    const idx = TARGET_MODE_CYCLE.indexOf(targetMode);
+    targetMode = TARGET_MODE_CYCLE[(idx + 1) % TARGET_MODE_CYCLE.length];
+  }
+
+  function targetLabel(mode: TargetMode): string {
+    return mode === "both" ? "both" : mode;
+  }
+
+  function selectedTargets(mode: TargetMode): AgentName[] {
+    return mode === "both" ? ["claude", "codex"] : [mode];
+  }
+
+  function forceExit() {
+    if (exitInProgress) return;
+    exitInProgress = true;
+    processing = false;
+    stopStatusLoop();
+
+    ensureNewline();
+    process.stdout.write(chalk.yellow("\n  [exiting: terminating active agents...]\n"));
+    midLine = false;
+
+    terminateAll("SIGINT");
+
+    setTimeout(() => {
+      terminateAll("SIGKILL");
+      rl.close();
+      process.exit(0);
+    }, FORCE_EXIT_GRACE_MS);
+  }
+
+  function interruptSelected(mode: TargetMode) {
+    if (!processing) {
+      ensureNewline();
+      process.stdout.write(chalk.dim("\n  [idle: nothing to interrupt]\n\n"));
+      midLine = false;
+      refreshPrompt();
+      return;
+    }
+
+    const targets = selectedTargets(mode);
+    let interruptedCount = 0;
+    for (const agent of targets) {
+      if (!hasActiveProcess(agent)) continue;
+      const didInterrupt = mode === "both" ? true : interruptAgent(agent);
+      if (didInterrupt) {
+        interruptedAgents.add(agent);
+        interruptedCount += 1;
+      }
+    }
+
+    if (mode === "both" && interruptedCount > 0) {
+      interruptAll();
+    }
+
+    ensureNewline();
+    if (interruptedCount > 0) {
+      process.stdout.write(
+        chalk.yellow(`\n  [interrupt sent to ${targetLabel(mode)}]\n\n`),
+      );
+    } else {
+      process.stdout.write(
+        chalk.dim(`\n  [no active process for ${targetLabel(mode)}]\n\n`),
+      );
+    }
+    midLine = false;
+    refreshPrompt();
+  }
+
+  function handleInterruptShortcut() {
+    const now = Date.now();
+    if (now - lastInterruptAt < 80) return;
+    lastInterruptAt = now;
+    lastEscapeAt = 0;
+    interruptSelected(targetMode);
+  }
+
   function promptText(): string {
-    if (!processing) return chalk.bold.white("you> ");
+    if (!processing) return `${chalk.bold.white("you")} ${formatMode(targetMode)}${chalk.bold.white(">")} `;
 
     const statuses = (["claude", "codex"] as AgentName[])
       .map((agent) => formatAgentStatus(agent))
@@ -165,10 +272,10 @@ export async function runChatLoop(
 
     const spinner = SPINNER_FRAMES[spinnerIndex % SPINNER_FRAMES.length];
     if (statuses.length === 0) {
-      return chalk.bold.white(`you [${spinner} working]> `);
+      return `${chalk.bold.white("you")} ${formatMode(targetMode)} ${chalk.dim(`[${spinner} working]`)}${chalk.bold.white(">")} `;
     }
 
-    return chalk.bold.white(`you [${spinner} ${statuses.join(" | ")}]> `);
+    return `${chalk.bold.white("you")} ${formatMode(targetMode)} ${chalk.dim(`[${spinner} ${statuses.join(" | ")}]`)}${chalk.bold.white(">")} `;
   }
 
   function refreshPrompt() {
@@ -190,24 +297,57 @@ export async function runChatLoop(
     statusTimer = null;
   }
 
+  readline.emitKeypressEvents(process.stdin, rl);
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+    rawModeEnabled = true;
+  }
+
+  const onKeypress = (
+    str: string,
+    key?: { ctrl?: boolean; name?: string; shift?: boolean },
+  ) => {
+    const isEscape = key?.name === "escape" || str === "\u001b";
+    if (isEscape) {
+      const now = Date.now();
+      if (now - lastEscapeAt <= DOUBLE_ESC_WINDOW_MS) {
+        lastEscapeAt = 0;
+        forceExit();
+      } else {
+        lastEscapeAt = now;
+        ensureNewline();
+        process.stdout.write(chalk.dim("\n  [press Esc again quickly to exit]\n\n"));
+        midLine = false;
+        refreshPrompt();
+      }
+      return;
+    }
+
+    if (key?.shift && key.name === "tab") {
+      cycleTargetMode();
+      refreshPrompt();
+      return;
+    }
+
+    const isCtrlC = (key?.ctrl && key.name === "c") || str === "\u0003";
+    if (!isCtrlC) return;
+    handleInterruptShortcut();
+  };
+
+  process.stdin.on("keypress", onKeypress);
+
+  const onSigInt = () => {
+    handleInterruptShortcut();
+  };
+
+  const onRlSigInt = () => {
+    handleInterruptShortcut();
+  };
+
   refreshPrompt();
 
-  // Catch Ctrl+C (SIGINT) — interrupt agents if processing, exit if idle
-  process.on("SIGINT", () => {
-    if (processing) {
-      interrupted = true;
-      interruptAll();
-      ensureNewline();
-      process.stdout.write(chalk.yellow("\n  [interrupted]\n\n"));
-      midLine = false;
-      processing = false;
-      stopStatusLoop();
-      resetAgentStates();
-      refreshPrompt();
-    } else {
-      rl.close();
-    }
-  });
+  // SIGINT fallback (non-raw/non-TTY environments)
+  process.on("SIGINT", onSigInt);
 
   return new Promise<void>((resolve) => {
     let pasteBuffer: string[] = [];
@@ -221,18 +361,18 @@ export async function runChatLoop(
       }
 
       if (trimmed === "/quit" || trimmed === "/exit") {
-        rl.close();
+        forceExit();
         return;
       }
 
       processing = true;
-      interrupted = false;
+      interruptedAgents = new Set<AgentName>();
       lastWriter = null;
       resetAgentStates();
       startStatusLoop();
       refreshPrompt();
 
-      const parsed = parseInput(trimmed);
+      const parsed = parseInput(trimmed, targetMode);
       const { targets, message } = parsed;
 
       // /respond N — agents take turns responding to each other
@@ -244,9 +384,8 @@ export async function runChatLoop(
         process.stdout.write(chalk.dim(`  [agents responding for ${rounds} rounds...]\n`));
 
         for (let i = 0; i < rounds; i++) {
-          if (interrupted) break;
-
           const agent = order[i % 2];
+          if (wasInterrupted(agent)) break;
           const prompt = buildPrompt(transcript, sessions[agent]);
 
           if (!prompt.trim()) {
@@ -276,7 +415,7 @@ export async function runChatLoop(
               },
             );
 
-            if (interrupted) break;
+            if (wasInterrupted(agent)) break;
 
             ensureNewline();
             setAgentState(agent, "done");
@@ -284,8 +423,12 @@ export async function runChatLoop(
             transcript.push({ role: agent, text: response.text });
             sessions[agent].lastMessageIndex = transcript.length - 1;
           } catch (err) {
-            setAgentState(agent, "error");
-            if (!interrupted) printError(agent, err);
+            if (wasInterrupted(agent)) {
+              setAgentState(agent, "done");
+            } else {
+              setAgentState(agent, "error");
+              printError(agent, err);
+            }
             break;
           }
 
@@ -328,7 +471,7 @@ export async function runChatLoop(
             },
           );
 
-          if (!interrupted) {
+          if (!wasInterrupted(target)) {
             ensureNewline();
             setAgentState(target, "done");
             sessions[target].sessionId = response.sessionId;
@@ -336,8 +479,12 @@ export async function runChatLoop(
             sessions[target].lastMessageIndex = transcript.length - 1;
           }
         } catch (err) {
-          setAgentState(target, "error");
-          if (!interrupted) printError(target, err);
+          if (wasInterrupted(target)) {
+            setAgentState(target, "done");
+          } else {
+            setAgentState(target, "error");
+            printError(target, err);
+          }
         }
       } else {
         // Both agents — build prompts BEFORE starting either, then run in parallel
@@ -380,14 +527,22 @@ export async function runChatLoop(
           const target = targets[i];
           const result = results[i];
           if (result.status === "fulfilled") {
+            if (wasInterrupted(target)) {
+              setAgentState(target, "done");
+              continue;
+            }
             const { response } = result.value;
             setAgentState(target, "done");
             sessions[target].sessionId = response.sessionId;
             transcript.push({ role: target, text: response.text });
             sessions[target].lastMessageIndex = userMsgIdx;
           } else {
-            setAgentState(target, "error");
-            if (!interrupted) printError(target, result.reason);
+            if (wasInterrupted(target)) {
+              setAgentState(target, "done");
+            } else {
+              setAgentState(target, "error");
+              printError(target, result.reason);
+            }
           }
         }
       }
@@ -403,7 +558,14 @@ export async function runChatLoop(
     // After 50ms of no new lines, flush the buffer as one input.
     rl.on("line", (line) => {
       if (processing) {
-        process.stdout.write(chalk.dim("\n  [busy: wait for current turn or press Ctrl+C]\n"));
+        const trimmed = line.trim();
+        if (trimmed === "/quit" || trimmed === "/exit") {
+          forceExit();
+          return;
+        }
+        process.stdout.write(
+          chalk.dim("\n  [busy: wait, press Ctrl+C to interrupt, or Esc Esc to exit]\n"),
+        );
         refreshPrompt();
         return;
       }
@@ -418,8 +580,16 @@ export async function runChatLoop(
       }, 50);
     });
 
+    rl.on("SIGINT", onRlSigInt);
+
     rl.on("close", () => {
       stopStatusLoop();
+      process.off("SIGINT", onSigInt);
+      process.stdin.off("keypress", onKeypress);
+      rl.off("SIGINT", onRlSigInt);
+      if (rawModeEnabled && process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+      }
       console.log(chalk.cyan("\nGoodbye!"));
       resolve();
     });

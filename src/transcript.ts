@@ -46,7 +46,10 @@ export interface ParsedInput {
   respondStart?: AgentName;
 }
 
-export function parseInput(raw: string): ParsedInput {
+export function parseInput(
+  raw: string,
+  defaultTarget: AgentName | "both" = "both",
+): ParsedInput {
   const trimmed = raw.trim();
   if (trimmed.startsWith("/respond")) {
     const rest = trimmed.slice(9).trim();
@@ -63,5 +66,9 @@ export function parseInput(raw: string): ParsedInput {
     return { targets: ["codex"], message: trimmed.slice(7) };
   if (trimmed.startsWith("@both "))
     return { targets: ["claude", "codex"], message: trimmed.slice(6) };
-  return { targets: ["claude", "codex"], message: trimmed };
+
+  if (defaultTarget === "both") {
+    return { targets: ["claude", "codex"], message: trimmed };
+  }
+  return { targets: [defaultTarget], message: trimmed };
 }
