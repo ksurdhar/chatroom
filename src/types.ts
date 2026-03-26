@@ -15,4 +15,5 @@ export interface ToolUseEvent {
   agent: AgentName;
   tool: string;
   summary: string;
+  phase: "start" | "end";
 }
