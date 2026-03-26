@@ -1,30 +1,40 @@
 import * as readline from "node:readline";
 import chalk from "chalk";
-import type { AgentName, AgentSession, Message, ToolUseEvent } from "./types.js";
+import type {
+  AgentName,
+  AgentSession,
+  Message,
+  PendingTurn,
+  StateSnapshotV1,
+  TargetMode,
+  ToolUseEvent,
+} from "./types.js";
 import { buildPrompt, parseInput } from "./transcript.js";
 import { sendToAgent, hasActiveProcess, interruptAgent, interruptAll, terminateAll } from "./agents.js";
+import { createStateSnapshot } from "./state.js";
+
+const CLAUDE_COLOR = "#FF4FA3";
+const CODEX_COLOR = "#00C2FF";
 
 const COLORS: Record<AgentName, (s: string) => string> = {
-  claude: chalk.magenta,
-  codex: chalk.green,
+  claude: chalk.hex(CLAUDE_COLOR),
+  codex: chalk.hex(CODEX_COLOR),
 };
 
 const BOLD_COLORS: Record<AgentName, (s: string) => string> = {
-  claude: chalk.magenta.bold,
-  codex: chalk.green.bold,
+  claude: chalk.hex(CLAUDE_COLOR).bold,
+  codex: chalk.hex(CODEX_COLOR).bold,
 };
 
-const SPINNER_FRAMES = ["|", "/", "-", "\\"];
 const FORCE_EXIT_GRACE_MS = 250;
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
 const PASTE_FALLBACK_DEBOUNCE_MS = 150;
 const TARGET_MODE_CYCLE = ["both", "claude", "codex"] as const;
-type TargetMode = typeof TARGET_MODE_CYCLE[number];
 const TARGET_MODE_COLORS: Record<TargetMode, (s: string) => string> = {
   both: chalk.cyan.bold,
-  claude: chalk.magenta.bold,
-  codex: chalk.green.bold,
+  claude: chalk.hex(CLAUDE_COLOR).bold,
+  codex: chalk.hex(CODEX_COLOR).bold,
 };
 
 interface AgentUiState {
@@ -33,6 +43,16 @@ interface AgentUiState {
   activeTool: string | null;
   lastActivityAt: number;
 }
+
+interface ChatLoopOptions {
+  initialTargetMode?: TargetMode;
+  initialPendingTurn?: PendingTurn | null;
+  restoredAt?: string | null;
+}
+
+type ChatLoopResult =
+  | { kind: "exit" }
+  | { kind: "rebuild"; snapshot: StateSnapshotV1 };
 
 // Tracks which agent last wrote to stdout, so we can insert headers on switch
 let lastWriter: AgentName | null = null;
@@ -94,10 +114,47 @@ function createInitialAgentStates(): Record<AgentName, AgentUiState> {
   };
 }
 
+function formatClock(timestamp: string | null | undefined): string {
+  if (!timestamp) return "unknown time";
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "unknown time";
+  return date.toLocaleTimeString([], { hour12: false });
+}
+
+function transcriptColor(role: Message["role"]): (s: string) => string {
+  if (role === "claude") return chalk.hex(CLAUDE_COLOR);
+  if (role === "codex") return chalk.hex(CODEX_COLOR);
+  return chalk.white;
+}
+
+function printRestoredTranscript(
+  transcript: Message[],
+  restoredAt: string | null | undefined,
+  pendingTurn: PendingTurn | null,
+) {
+  process.stdout.write(chalk.cyan(`\n  [reloaded at ${formatClock(restoredAt)}]\n`));
+  if (transcript.length === 0) {
+    process.stdout.write(chalk.dim("  [no prior transcript]\n\n"));
+  } else {
+    for (const msg of transcript) {
+      const color = transcriptColor(msg.role);
+      process.stdout.write(color(`[${msg.role}] ${msg.text}\n`));
+    }
+    process.stdout.write("\n");
+  }
+
+  if (pendingTurn) {
+    process.stdout.write(
+      chalk.yellow("  [last turn may be incomplete; run /retry to resend it]\n\n"),
+    );
+  }
+}
+
 export async function runChatLoop(
   transcript: Message[],
   sessions: Record<AgentName, AgentSession>,
-): Promise<void> {
+  options: ChatLoopOptions = {},
+): Promise<ChatLoopResult> {
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -105,10 +162,10 @@ export async function runChatLoop(
   });
 
   let processing = false;
-  let targetMode: TargetMode = "both";
+  let targetMode: TargetMode = options.initialTargetMode ?? "both";
+  let pendingTurn: PendingTurn | null = options.initialPendingTurn ?? null;
+  let rebuildSnapshot: StateSnapshotV1 | null = null;
   let interruptedAgents = new Set<AgentName>();
-  let spinnerIndex = 0;
-  let statusTimer: ReturnType<typeof setInterval> | null = null;
   let rawModeEnabled = false;
   let exitInProgress = false;
   let lastInterruptAt = 0;
@@ -152,41 +209,12 @@ export async function runChatLoop(
     }
   }
 
-  function formatAgentStatus(agent: AgentName): string | null {
-    const st = agentStates[agent];
-    if (st.state === "idle") return null;
-
-    const silenceSec = Math.floor((Date.now() - st.lastActivityAt) / 1000);
-    const baseLabel = st.state === "tool_running"
-      ? `${agent}:running ${st.activeTool ?? "tool"}`
-      : st.state === "error"
-      ? `${agent}:error`
-      : st.state === "done"
-      ? `${agent}:done`
-      : `${agent}:working`;
-
-    if (st.state === "error" || st.state === "done") return baseLabel;
-
-    if (silenceSec >= 60) return `${baseLabel} possibly-stalled (${silenceSec}s)`;
-    if (silenceSec >= 15) return `${baseLabel} still-working (${silenceSec}s)`;
-    if (silenceSec >= 3) return `${baseLabel} ... (${silenceSec}s)`;
-
-    return baseLabel;
-  }
-
   function wasInterrupted(agent: AgentName): boolean {
     return interruptedAgents.has(agent);
   }
 
   function formatMode(mode: TargetMode): string {
     return TARGET_MODE_COLORS[mode](`@${mode}`);
-  }
-
-  function printTargetMode(mode: TargetMode) {
-    ensureNewline();
-    const colorFn = TARGET_MODE_COLORS[mode];
-    process.stdout.write(colorFn(`  ▸ ${mode}`) + "\n");
-    midLine = false;
   }
 
   function cycleTargetMode() {
@@ -202,9 +230,14 @@ export async function runChatLoop(
     return mode === "both" ? ["claude", "codex"] : [mode];
   }
 
+  function getStateSnapshot(): StateSnapshotV1 {
+    return createStateSnapshot(transcript, sessions, targetMode, pendingTurn);
+  }
+
   function resetChatsForMode(mode: TargetMode) {
     if (mode === "both") {
       transcript.length = 0;
+      pendingTurn = null;
     }
 
     for (const agent of selectedTargets(mode)) {
@@ -217,7 +250,6 @@ export async function runChatLoop(
     if (exitInProgress) return;
     exitInProgress = true;
     processing = false;
-    stopStatusLoop();
 
     ensureNewline();
     process.stdout.write(chalk.yellow("\n  [shutting down...]\n"));
@@ -290,18 +322,7 @@ export async function runChatLoop(
 
   function promptText(): string {
     if (isPasting) return `${chalk.bold.white("you")} ${chalk.yellow("[pasting...]")}${chalk.bold.white(">")} `;
-    if (!processing) return `${chalk.bold.white("you")} ${formatMode(targetMode)}${chalk.bold.white(">")} `;
-
-    const statuses = (["claude", "codex"] as AgentName[])
-      .map((agent) => formatAgentStatus(agent))
-      .filter((s): s is string => Boolean(s));
-
-    const spinner = SPINNER_FRAMES[spinnerIndex % SPINNER_FRAMES.length];
-    if (statuses.length === 0) {
-      return `${chalk.bold.white("you")} ${formatMode(targetMode)} ${chalk.dim(`[${spinner} working]`)}${chalk.bold.white(">")} `;
-    }
-
-    return `${chalk.bold.white("you")} ${formatMode(targetMode)} ${chalk.dim(`[${spinner} ${statuses.join(" | ")}]`)}${chalk.bold.white(">")} `;
+    return `${chalk.bold.white("you")} ${formatMode(targetMode)}${chalk.bold.white(">")} `;
   }
 
   function refreshPrompt() {
@@ -309,24 +330,23 @@ export async function runChatLoop(
     rl.prompt(true);
   }
 
-  function startStatusLoop() {
-    if (statusTimer) clearInterval(statusTimer);
-    statusTimer = setInterval(() => {
-      spinnerIndex = (spinnerIndex + 1) % SPINNER_FRAMES.length;
-      if (processing && !midLine) refreshPrompt();
-    }, 200);
-  }
-
-  function stopStatusLoop() {
-    if (!statusTimer) return;
-    clearInterval(statusTimer);
-    statusTimer = null;
+  function finishProcessing() {
+    process.stdout.write("\n");
+    processing = false;
+    resetAgentStates();
+    refreshPrompt();
   }
 
   readline.emitKeypressEvents(process.stdin, rl);
   if (process.stdin.isTTY) {
-    process.stdin.setRawMode(true);
-    rawModeEnabled = true;
+    try {
+      process.stdin.setRawMode(true);
+      rawModeEnabled = true;
+    } catch {
+      process.stdout.write(
+        chalk.yellow("  [warning: raw mode unavailable - input may behave differently]\n"),
+      );
+    }
   }
 
   // Enable bracketed paste so terminals wrap pasted text in markers
@@ -390,12 +410,16 @@ export async function runChatLoop(
     handleInterruptShortcut();
   };
 
+  if (options.restoredAt) {
+    printRestoredTranscript(transcript, options.restoredAt, pendingTurn);
+  }
+
   refreshPrompt();
 
   // SIGINT fallback (non-raw/non-TTY environments)
   process.on("SIGINT", onSigInt);
 
-  return new Promise<void>((resolve) => {
+  return new Promise<ChatLoopResult>((resolve) => {
     let pasteBuffer: string[] = [];
     let pasteTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -406,8 +430,19 @@ export async function runChatLoop(
         return;
       }
 
+      if (trimmed === "/rebuild") {
+        rebuildSnapshot = getStateSnapshot();
+        ensureNewline();
+        process.stdout.write(chalk.cyan("\n  [rebuild requested]\n"));
+        process.stdout.write(chalk.dim("  [running build and relaunching...]\n\n"));
+        midLine = false;
+        rl.close();
+        return;
+      }
+
       if (trimmed === "/clear" || trimmed === "/new") {
         resetChatsForMode(targetMode);
+        pendingTurn = null;
         ensureNewline();
         process.stdout.write(
           chalk.cyan(`\n  [started new chat for ${targetLabel(targetMode)}]\n\n`),
@@ -422,15 +457,28 @@ export async function runChatLoop(
         return;
       }
 
+      if (trimmed === "/retry" && !pendingTurn) {
+        ensureNewline();
+        process.stdout.write(chalk.dim("\n  [no interrupted turn to retry]\n\n"));
+        midLine = false;
+        refreshPrompt();
+        return;
+      }
+
       processing = true;
       interruptedAgents = new Set<AgentName>();
       lastWriter = null;
       resetAgentStates();
-      startStatusLoop();
-      refreshPrompt();
 
-      const parsed = parseInput(trimmed, targetMode);
+      const isRetry = trimmed === "/retry" && pendingTurn != null;
+      const parsed = isRetry
+        ? { targets: [...pendingTurn!.targets], message: pendingTurn!.message }
+        : parseInput(trimmed, targetMode);
       const { targets, message } = parsed;
+
+      if (isRetry) {
+        process.stdout.write(chalk.dim(`  [retrying ${targets.join(", ")}]\n`));
+      }
 
       // /respond N — agents take turns responding to each other
       if (parsed.respond) {
@@ -451,7 +499,6 @@ export async function runChatLoop(
           }
 
           setAgentState(agent, "streaming");
-          refreshPrompt();
 
           try {
             const response = await sendToAgent(
@@ -465,7 +512,6 @@ export async function runChatLoop(
               (event) => {
                 applyToolEvent(event);
                 showToolUse(event);
-                refreshPrompt();
               },
               () => {
                 markActivity(agent);
@@ -488,26 +534,23 @@ export async function runChatLoop(
             }
             break;
           }
-
-          refreshPrompt();
         }
 
-        process.stdout.write("\n");
-        processing = false;
-        stopStatusLoop();
-        resetAgentStates();
-        refreshPrompt();
+        finishProcessing();
         return;
       }
 
-      transcript.push({ role: "user", text: message });
+      if (!isRetry) {
+        pendingTurn = { message, targets: [...targets] };
+        transcript.push({ role: "user", text: message });
+      }
 
       if (targets.length === 1) {
         // Single agent — straightforward
         const target = targets[0];
+        let completed = false;
         const prompt = buildPrompt(transcript, sessions[target]);
         setAgentState(target, "streaming");
-        refreshPrompt();
 
         try {
           const response = await sendToAgent(
@@ -521,7 +564,6 @@ export async function runChatLoop(
             (event) => {
               applyToolEvent(event);
               showToolUse(event);
-              refreshPrompt();
             },
             () => {
               markActivity(target);
@@ -534,6 +576,7 @@ export async function runChatLoop(
             sessions[target].sessionId = response.sessionId;
             transcript.push({ role: target, text: response.text });
             sessions[target].lastMessageIndex = transcript.length - 1;
+            completed = true;
           }
         } catch (err) {
           if (wasInterrupted(target)) {
@@ -543,15 +586,19 @@ export async function runChatLoop(
             printError(target, err);
           }
         }
+
+        if (completed) {
+          pendingTurn = null;
+        }
       } else {
         // Both agents — build prompts BEFORE starting either, then run in parallel
         const userMsgIdx = transcript.length - 1;
+        let completedCount = 0;
         const prompts = new Map<AgentName, string>();
         for (const target of targets) {
           prompts.set(target, buildPrompt(transcript, sessions[target]));
           setAgentState(target, "streaming");
         }
-        refreshPrompt();
 
         const results = await Promise.allSettled(
           targets.map((target) =>
@@ -566,7 +613,6 @@ export async function runChatLoop(
               (event) => {
                 applyToolEvent(event);
                 showToolUse(event);
-                refreshPrompt();
               },
               () => {
                 markActivity(target);
@@ -593,6 +639,7 @@ export async function runChatLoop(
             sessions[target].sessionId = response.sessionId;
             transcript.push({ role: target, text: response.text });
             sessions[target].lastMessageIndex = userMsgIdx;
+            completedCount += 1;
           } else {
             if (wasInterrupted(target)) {
               setAgentState(target, "done");
@@ -602,13 +649,30 @@ export async function runChatLoop(
             }
           }
         }
+
+        if (completedCount === targets.length) {
+          pendingTurn = null;
+        } else {
+          // Narrow pendingTurn to only the agents that failed/were interrupted
+          const completedTargets = new Set<AgentName>();
+          for (let i = 0; i < targets.length; i++) {
+            if (results[i].status === "fulfilled" && !wasInterrupted(targets[i])) {
+              completedTargets.add(targets[i]);
+            }
+          }
+          const failedTargets = targets.filter((t) => !completedTargets.has(t));
+          if (failedTargets.length > 0) {
+            pendingTurn = { message, targets: failedTargets };
+            process.stdout.write(
+              chalk.dim(`  [/retry available for: ${failedTargets.join(", ")}]\n`),
+            );
+          } else {
+            pendingTurn = null;
+          }
+        }
       }
 
-      process.stdout.write("\n");
-      processing = false;
-      stopStatusLoop();
-      resetAgentStates();
-      refreshPrompt();
+      finishProcessing();
     }
 
     flushBracketedPaste = (text: string) => processInput(text);
@@ -623,6 +687,13 @@ export async function runChatLoop(
         const trimmed = line.trim();
         if (trimmed === "/quit" || trimmed === "/exit") {
           gracefulShutdown();
+          return;
+        }
+        if (trimmed === "/rebuild") {
+          process.stdout.write(
+            chalk.dim("\n  [busy: interrupt first, then run /rebuild]\n"),
+          );
+          refreshPrompt();
           return;
         }
         process.stdout.write(
@@ -645,16 +716,23 @@ export async function runChatLoop(
     rl.on("SIGINT", onRlSigInt);
 
     rl.on("close", () => {
-      stopStatusLoop();
       process.stdout.write("\x1b[?2004l");
       process.off("SIGINT", onSigInt);
       process.stdin.off("keypress", onKeypress);
       rl.off("SIGINT", onRlSigInt);
       if (rawModeEnabled && process.stdin.isTTY) {
-        process.stdin.setRawMode(false);
+        try {
+          process.stdin.setRawMode(false);
+        } catch {
+          // PTY may already be torn down — ignore
+        }
+      }
+      if (rebuildSnapshot) {
+        resolve({ kind: "rebuild", snapshot: rebuildSnapshot });
+        return;
       }
       console.log(chalk.cyan("\nGoodbye!"));
-      resolve();
+      resolve({ kind: "exit" });
     });
   });
 }
