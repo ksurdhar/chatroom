@@ -17,6 +17,9 @@ const BOLD_COLORS: Record<AgentName, (s: string) => string> = {
 const SPINNER_FRAMES = ["|", "/", "-", "\\"];
 const DOUBLE_ESC_WINDOW_MS = 500;
 const FORCE_EXIT_GRACE_MS = 250;
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
+const PASTE_FALLBACK_DEBOUNCE_MS = 150;
 const TARGET_MODE_CYCLE = ["both", "claude", "codex"] as const;
 type TargetMode = typeof TARGET_MODE_CYCLE[number];
 const TARGET_MODE_COLORS: Record<TargetMode, (s: string) => string> = {
@@ -111,6 +114,9 @@ export async function runChatLoop(
   let exitInProgress = false;
   let lastEscapeAt = 0;
   let lastInterruptAt = 0;
+  let isPasting = false;
+  let bracketedPasteRaw = "";
+  let flushBracketedPaste: ((text: string) => void) | null = null;
   let agentStates = createInitialAgentStates();
 
   function resetAgentStates() {
@@ -203,6 +209,7 @@ export async function runChatLoop(
     exitInProgress = true;
     processing = false;
     stopStatusLoop();
+    process.stdout.write("\x1b[?2004l");
 
     ensureNewline();
     process.stdout.write(chalk.yellow("\n  [exiting: terminating active agents...]\n"));
@@ -264,6 +271,7 @@ export async function runChatLoop(
   }
 
   function promptText(): string {
+    if (isPasting) return `${chalk.bold.white("you")} ${chalk.yellow("[pasting...]")}${chalk.bold.white(">")} `;
     if (!processing) return `${chalk.bold.white("you")} ${formatMode(targetMode)}${chalk.bold.white(">")} `;
 
     const statuses = (["claude", "codex"] as AgentName[])
@@ -303,10 +311,46 @@ export async function runChatLoop(
     rawModeEnabled = true;
   }
 
+  // Enable bracketed paste so terminals wrap pasted text in markers
+  process.stdout.write("\x1b[?2004h");
+
   const onKeypress = (
     str: string,
-    key?: { ctrl?: boolean; name?: string; shift?: boolean },
+    key?: { ctrl?: boolean; name?: string; shift?: boolean; sequence?: string },
   ) => {
+    // Bracketed paste detection — must run before any other key handling
+    const seq = key?.sequence ?? str;
+    if (seq === PASTE_START) {
+      isPasting = true;
+      bracketedPasteRaw = "";
+      return;
+    }
+    if (seq === PASTE_END) {
+      isPasting = false;
+      const full = bracketedPasteRaw;
+      bracketedPasteRaw = "";
+      if (!full.trim() || !flushBracketedPaste) {
+        refreshPrompt();
+        return;
+      }
+      if (processing) {
+        ensureNewline();
+        process.stdout.write(
+          chalk.dim("\n  [busy: wait, press Ctrl+C to interrupt, or Esc Esc to exit]\n"),
+        );
+        midLine = false;
+        refreshPrompt();
+        return;
+      }
+      flushBracketedPaste(full);
+      return;
+    }
+    if (isPasting) {
+      // Buffer raw characters (including newlines) during paste
+      bracketedPasteRaw += str;
+      return;
+    }
+
     const isEscape = key?.name === "escape" || str === "\u001b";
     if (isEscape) {
       const now = Date.now();
@@ -554,9 +598,14 @@ export async function runChatLoop(
       refreshPrompt();
     }
 
-    // Buffer rapid lines (multiline paste) into a single message.
-    // After 50ms of no new lines, flush the buffer as one input.
+    flushBracketedPaste = (text: string) => processInput(text);
+
+    // Buffer rapid lines (multiline paste fallback for terminals without
+    // bracketed paste support). Debounce at 150ms to catch pasted blocks.
     rl.on("line", (line) => {
+      // During bracketed paste, keypress handler collects raw chars — skip line processing
+      if (isPasting) return;
+
       if (processing) {
         const trimmed = line.trim();
         if (trimmed === "/quit" || trimmed === "/exit") {
@@ -577,13 +626,14 @@ export async function runChatLoop(
         pasteBuffer = [];
         pasteTimer = null;
         processInput(full);
-      }, 50);
+      }, PASTE_FALLBACK_DEBOUNCE_MS);
     });
 
     rl.on("SIGINT", onRlSigInt);
 
     rl.on("close", () => {
       stopStatusLoop();
+      process.stdout.write("\x1b[?2004l");
       process.off("SIGINT", onSigInt);
       process.stdin.off("keypress", onKeypress);
       rl.off("SIGINT", onRlSigInt);
