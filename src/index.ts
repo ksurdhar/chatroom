@@ -25,8 +25,12 @@ interface CliArgs {
   restorePath: string | null;
 }
 
-const CLAUDE_COLOR = "#FF4FA3";
-const CODEX_COLOR = "#00C2FF";
+// Vibrant colors for UI chrome
+const CLAUDE_COLOR = "#FF8C00";
+const CODEX_COLOR = "#1E90FF";
+// Lighter versions for agent output
+const CLAUDE_COLOR_LIGHT = "#FFC680";
+const CODEX_COLOR_LIGHT = "#8FC8FF";
 
 function checkCli(name: string): boolean {
   try {
@@ -109,8 +113,8 @@ async function preseedAgents(
       transcript.push({ role: agent, text: result.value.text });
       sessions[agent].lastMessageIndex = transcript.length - 1;
       const color = agent === "claude"
-        ? chalk.hex(CLAUDE_COLOR)
-        : chalk.hex(CODEX_COLOR);
+        ? chalk.hex(CLAUDE_COLOR_LIGHT)
+        : chalk.hex(CODEX_COLOR_LIGHT);
       console.log(color(`\n  ${agent}: ${result.value.text}`));
     } else {
       console.log(chalk.red(`  ${agent} failed to connect: ${result.reason}`));

@@ -13,12 +13,16 @@ import { buildPrompt, parseInput } from "./transcript.js";
 import { sendToAgent, hasActiveProcess, interruptAgent, interruptAll, terminateAll } from "./agents.js";
 import { createStateSnapshot } from "./state.js";
 
-const CLAUDE_COLOR = "#FF4FA3";
-const CODEX_COLOR = "#00C2FF";
+// Vibrant colors for prompts, headers, and UI chrome
+const CLAUDE_COLOR = "#FF8C00";
+const CODEX_COLOR = "#1E90FF";
+// Lighter (50%) versions for streamed agent output
+const CLAUDE_COLOR_LIGHT = "#FFC680";
+const CODEX_COLOR_LIGHT = "#8FC8FF";
 
 const COLORS: Record<AgentName, (s: string) => string> = {
-  claude: chalk.hex(CLAUDE_COLOR),
-  codex: chalk.hex(CODEX_COLOR),
+  claude: chalk.hex(CLAUDE_COLOR_LIGHT),
+  codex: chalk.hex(CODEX_COLOR_LIGHT),
 };
 
 const BOLD_COLORS: Record<AgentName, (s: string) => string> = {
@@ -27,6 +31,7 @@ const BOLD_COLORS: Record<AgentName, (s: string) => string> = {
 };
 
 const FORCE_EXIT_GRACE_MS = 250;
+const SPINNER_FRAMES = ["|", "/", "-", "\\"];
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
 const PASTE_FALLBACK_DEBOUNCE_MS = 150;
@@ -42,6 +47,8 @@ interface AgentUiState {
   inFlightTools: number;
   activeTool: string | null;
   lastActivityAt: number;
+  startedAt: number;
+  finishedAt: number;
 }
 
 interface ChatLoopOptions {
@@ -104,12 +111,16 @@ function createInitialAgentStates(): Record<AgentName, AgentUiState> {
       inFlightTools: 0,
       activeTool: null,
       lastActivityAt: now,
+      startedAt: now,
+      finishedAt: 0,
     },
     codex: {
       state: "idle",
       inFlightTools: 0,
       activeTool: null,
       lastActivityAt: now,
+      startedAt: now,
+      finishedAt: 0,
     },
   };
 }
@@ -122,8 +133,8 @@ function formatClock(timestamp: string | null | undefined): string {
 }
 
 function transcriptColor(role: Message["role"]): (s: string) => string {
-  if (role === "claude") return chalk.hex(CLAUDE_COLOR);
-  if (role === "codex") return chalk.hex(CODEX_COLOR);
+  if (role === "claude") return chalk.hex(CLAUDE_COLOR_LIGHT);
+  if (role === "codex") return chalk.hex(CODEX_COLOR_LIGHT);
   return chalk.white;
 }
 
@@ -166,6 +177,10 @@ export async function runChatLoop(
   let pendingTurn: PendingTurn | null = options.initialPendingTurn ?? null;
   let rebuildSnapshot: StateSnapshotV1 | null = null;
   let interruptedAgents = new Set<AgentName>();
+  let spinnerIndex = 0;
+  let statusTimer: ReturnType<typeof setInterval> | null = null;
+  let statusVisible = false;
+  let statusText = "";
   let rawModeEnabled = false;
   let exitInProgress = false;
   let lastInterruptAt = 0;
@@ -183,7 +198,17 @@ export async function runChatLoop(
   }
 
   function setAgentState(agent: AgentName, state: AgentUiState["state"]) {
-    agentStates[agent].state = state;
+    const st = agentStates[agent];
+    const wasActive = st.state === "streaming" || st.state === "tool_running";
+    const becomingActive = state === "streaming" || state === "tool_running";
+    if (becomingActive && !wasActive) {
+      st.startedAt = Date.now();
+      st.finishedAt = 0;
+    }
+    if (state === "done" || state === "error") {
+      st.finishedAt = Date.now();
+    }
+    st.state = state;
     markActivity(agent);
   }
 
@@ -230,6 +255,119 @@ export async function runChatLoop(
     return mode === "both" ? ["claude", "codex"] : [mode];
   }
 
+  function formatElapsed(ms: number): string {
+    const sec = Math.floor(ms / 1000);
+    if (sec < 60) return `${sec}s`;
+    const min = Math.floor(sec / 60);
+    const remainSec = sec % 60;
+    return `${min}m${remainSec}s`;
+  }
+
+  function formatAgentStatus(agent: AgentName): string | null {
+    const st = agentStates[agent];
+    if (st.state === "idle") return null;
+
+    const endTime = st.finishedAt || Date.now();
+    const elapsed = formatElapsed(endTime - st.startedAt);
+
+    if (st.state === "error") return `${agent}:error after ${elapsed}`;
+    if (st.state === "done") return `${agent}:done in ${elapsed}`;
+
+    const silenceSec = Math.floor((Date.now() - st.lastActivityAt) / 1000);
+
+    const action = st.state === "tool_running"
+      ? `running ${st.activeTool ?? "tool"}`
+      : "working";
+
+    let suffix = "";
+    if (silenceSec >= 60) suffix = " stalled?";
+    else if (silenceSec >= 15) suffix = " still-working";
+
+    return `${agent}:${action} ${elapsed}${suffix}`;
+  }
+
+  function clearStatusLine() {
+    if (!statusVisible) return;
+    // Erase the status text on the current line
+    readline.clearLine(process.stdout, 0);
+    readline.cursorTo(process.stdout, 0);
+    statusVisible = false;
+    statusText = "";
+    midLine = false;
+  }
+
+  function renderStatusLine() {
+    if (!processing) return;
+
+    const statuses = (["claude", "codex"] as AgentName[])
+      .map((agent) => formatAgentStatus(agent))
+      .filter((s): s is string => Boolean(s));
+    const spinner = SPINNER_FRAMES[spinnerIndex % SPINNER_FRAMES.length];
+    const nextStatus = statuses.length === 0
+      ? `${spinner} working`
+      : `${spinner} ${statuses.join(" | ")}`;
+
+    if (statusVisible && nextStatus === statusText) return;
+
+    if (statusVisible) {
+      // Overwrite existing status line in place
+      readline.clearLine(process.stdout, 0);
+      readline.cursorTo(process.stdout, 0);
+    } else if (midLine) {
+      // Agent output is mid-line — drop to a new line for status
+      process.stdout.write("\n");
+    }
+    process.stdout.write(chalk.dim(`  [${nextStatus}]`));
+    statusVisible = true;
+    statusText = nextStatus;
+    midLine = true;
+  }
+
+  function redrawStatusLine() {
+    if (!processing) return;
+    renderStatusLine();
+  }
+
+  function startStatusLoop() {
+    if (statusTimer) clearInterval(statusTimer);
+    spinnerIndex = 0;
+    statusTimer = setInterval(() => {
+      spinnerIndex = (spinnerIndex + 1) % SPINNER_FRAMES.length;
+      redrawStatusLine();
+    }, 200);
+    redrawStatusLine();
+  }
+
+  function stopStatusLoop() {
+    if (!statusTimer) return;
+    clearInterval(statusTimer);
+    statusTimer = null;
+  }
+
+  function writeStreamDelta(agent: AgentName, text: string) {
+    clearStatusLine();
+    streamDelta(agent, text);
+    // Codex emits full message blocks (not token deltas), so force a line break
+    // to reopen the dedicated status lane while other agents may still be running.
+    if (agent === "codex" && !text.endsWith("\n")) {
+      process.stdout.write("\n");
+      midLine = false;
+    }
+    redrawStatusLine();
+  }
+
+  function writeToolUse(event: ToolUseEvent) {
+    clearStatusLine();
+    showToolUse(event);
+    redrawStatusLine();
+  }
+
+  function writeAgentError(agent: AgentName, err: unknown) {
+    clearStatusLine();
+    printError(agent, err);
+    redrawStatusLine();
+  }
+
   function getStateSnapshot(): StateSnapshotV1 {
     return createStateSnapshot(transcript, sessions, targetMode, pendingTurn);
   }
@@ -250,6 +388,8 @@ export async function runChatLoop(
     if (exitInProgress) return;
     exitInProgress = true;
     processing = false;
+    stopStatusLoop();
+    clearStatusLine();
 
     ensureNewline();
     process.stdout.write(chalk.yellow("\n  [shutting down...]\n"));
@@ -327,10 +467,14 @@ export async function runChatLoop(
 
   function refreshPrompt() {
     rl.setPrompt(promptText());
-    rl.prompt(true);
+    if (!processing) {
+      rl.prompt(true);
+    }
   }
 
   function finishProcessing() {
+    stopStatusLoop();
+    clearStatusLine();
     process.stdout.write("\n");
     processing = false;
     resetAgentStates();
@@ -410,6 +554,14 @@ export async function runChatLoop(
     handleInterruptShortcut();
   };
 
+  const onSigWinch = () => {
+    clearStatusLine();
+    redrawStatusLine();
+    if (!processing) {
+      refreshPrompt();
+    }
+  };
+
   if (options.restoredAt) {
     printRestoredTranscript(transcript, options.restoredAt, pendingTurn);
   }
@@ -418,6 +570,7 @@ export async function runChatLoop(
 
   // SIGINT fallback (non-raw/non-TTY environments)
   process.on("SIGINT", onSigInt);
+  process.on("SIGWINCH", onSigWinch);
 
   return new Promise<ChatLoopResult>((resolve) => {
     let pasteBuffer: string[] = [];
@@ -469,6 +622,7 @@ export async function runChatLoop(
       interruptedAgents = new Set<AgentName>();
       lastWriter = null;
       resetAgentStates();
+      startStatusLoop();
 
       const isRetry = trimmed === "/retry" && pendingTurn != null;
       const parsed = isRetry
@@ -477,7 +631,9 @@ export async function runChatLoop(
       const { targets, message } = parsed;
 
       if (isRetry) {
+        clearStatusLine();
         process.stdout.write(chalk.dim(`  [retrying ${targets.join(", ")}]\n`));
+        redrawStatusLine();
       }
 
       // /respond N — agents take turns responding to each other
@@ -486,7 +642,9 @@ export async function runChatLoop(
         const first = parsed.respondStart ?? "claude";
         const second: AgentName = first === "claude" ? "codex" : "claude";
         const order: AgentName[] = [first, second];
+        clearStatusLine();
         process.stdout.write(chalk.dim(`  [agents responding for ${rounds} rounds...]\n`));
+        redrawStatusLine();
 
         for (let i = 0; i < rounds; i++) {
           const agent = order[i % 2];
@@ -494,7 +652,9 @@ export async function runChatLoop(
           const prompt = buildPrompt(transcript, sessions[agent]);
 
           if (!prompt.trim()) {
+            clearStatusLine();
             process.stdout.write(chalk.dim(`  [nothing new for ${agent} to respond to]\n`));
+            redrawStatusLine();
             break;
           }
 
@@ -507,11 +667,11 @@ export async function runChatLoop(
               sessions[agent],
               (delta) => {
                 setAgentState(agent, "streaming");
-                streamDelta(agent, delta);
+                writeStreamDelta(agent, delta);
               },
               (event) => {
                 applyToolEvent(event);
-                showToolUse(event);
+                writeToolUse(event);
               },
               () => {
                 markActivity(agent);
@@ -530,7 +690,7 @@ export async function runChatLoop(
               setAgentState(agent, "done");
             } else {
               setAgentState(agent, "error");
-              printError(agent, err);
+              writeAgentError(agent, err);
             }
             break;
           }
@@ -559,11 +719,11 @@ export async function runChatLoop(
             sessions[target],
             (delta) => {
               setAgentState(target, "streaming");
-              streamDelta(target, delta);
+              writeStreamDelta(target, delta);
             },
             (event) => {
               applyToolEvent(event);
-              showToolUse(event);
+              writeToolUse(event);
             },
             () => {
               markActivity(target);
@@ -583,7 +743,7 @@ export async function runChatLoop(
             setAgentState(target, "done");
           } else {
             setAgentState(target, "error");
-            printError(target, err);
+            writeAgentError(target, err);
           }
         }
 
@@ -608,16 +768,26 @@ export async function runChatLoop(
               sessions[target],
               (delta) => {
                 setAgentState(target, "streaming");
-                streamDelta(target, delta);
+                writeStreamDelta(target, delta);
               },
               (event) => {
                 applyToolEvent(event);
-                showToolUse(event);
+                writeToolUse(event);
               },
               () => {
                 markActivity(target);
               },
-            ).then((response) => ({ target, response })),
+            ).then((response) => {
+              setAgentState(target, "done");
+              return { target, response };
+            }).catch((error) => {
+              if (wasInterrupted(target)) {
+                setAgentState(target, "done");
+              } else {
+                setAgentState(target, "error");
+              }
+              throw error;
+            }),
           ),
         );
 
@@ -630,10 +800,7 @@ export async function runChatLoop(
           const target = targets[i];
           const result = results[i];
           if (result.status === "fulfilled") {
-            if (wasInterrupted(target)) {
-              setAgentState(target, "done");
-              continue;
-            }
+            if (wasInterrupted(target)) continue;
             const { response } = result.value;
             setAgentState(target, "done");
             sessions[target].sessionId = response.sessionId;
@@ -641,11 +808,8 @@ export async function runChatLoop(
             sessions[target].lastMessageIndex = userMsgIdx;
             completedCount += 1;
           } else {
-            if (wasInterrupted(target)) {
-              setAgentState(target, "done");
-            } else {
-              setAgentState(target, "error");
-              printError(target, result.reason);
+            if (!wasInterrupted(target)) {
+              writeAgentError(target, result.reason);
             }
           }
         }
@@ -663,9 +827,11 @@ export async function runChatLoop(
           const failedTargets = targets.filter((t) => !completedTargets.has(t));
           if (failedTargets.length > 0) {
             pendingTurn = { message, targets: failedTargets };
+            clearStatusLine();
             process.stdout.write(
               chalk.dim(`  [/retry available for: ${failedTargets.join(", ")}]\n`),
             );
+            redrawStatusLine();
           } else {
             pendingTurn = null;
           }
@@ -718,8 +884,11 @@ export async function runChatLoop(
     rl.on("close", () => {
       process.stdout.write("\x1b[?2004l");
       process.off("SIGINT", onSigInt);
+      process.off("SIGWINCH", onSigWinch);
       process.stdin.off("keypress", onKeypress);
       rl.off("SIGINT", onRlSigInt);
+      stopStatusLoop();
+      clearStatusLine();
       if (rawModeEnabled && process.stdin.isTTY) {
         try {
           process.stdin.setRawMode(false);
